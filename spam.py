@@ -1226,25 +1226,14 @@ async def on_ready():
 
 
 # =========================================================
-# FARM TIMER (PRIVATE PER USER) - CHOOSE LOOMING OR FENCE
+# FARM TIMER (PRIVATE PER USER) - CUSTOM FARM TYPES
 # =========================================================
 from typing import Optional
 
-LOOMING_SECONDS = (3 * 24 * 60 * 60) + (16 * 60 * 60)               # 3d 16h
-FENCE_SECONDS = (1 * 24 * 60 * 60) + (5 * 60 * 60) + (20 * 60)      # 1d 5h 20m
-
-FARM_TIMERS = {
-    "looming": {"label": "Looming", "seconds": LOOMING_SECONDS, "emoji": "🧵"},
-    "fence":   {"label": "Fence",   "seconds": FENCE_SECONDS,   "emoji": "🚧"},
-}
-FARM_CHOICES = [
-    app_commands.Choice(name="🧵 Looming (3d 16h)", value="looming"),
-    app_commands.Choice(name="🚧 Fence (1d 5h 20m)", value="fence"),
-]
-
-# Keep track of open /farm messages so their countdowns can update automatically.
-# Key: Discord message ID; value: (user ID, Discord message object).
+# Farm types are saved in the database. Only the bot owners can
+# create or edit farm types. Users can use any farm type you create.
 FARM_PANEL_MESSAGES = {}
+
 
 def format_long_time(seconds):
     """Format seconds as e.g. '3d 16h 5m 30s'."""
@@ -1253,6 +1242,7 @@ def format_long_time(seconds):
     hours = (seconds % 86400) // 3600
     minutes = (seconds % 3600) // 60
     secs = seconds % 60
+
     if days > 0:
         return f"{days}d {hours}h {minutes}m {secs}s"
     if hours > 0:
@@ -1260,6 +1250,7 @@ def format_long_time(seconds):
     if minutes > 0:
         return f"{minutes}m {secs}s"
     return f"{secs}s"
+
 
 def farm_countdown(end_time):
     if end_time is None:
@@ -1269,9 +1260,71 @@ def farm_countdown(end_time):
         return "🟢 **READY**"
     return f"⏳ `{format_long_time(remaining)}`"
 
+
+def normalize_farm_type(value):
+    return value.strip().lower().replace(" ", "_")
+
+
+def farm_label(value):
+    return value.replace("_", " ").title()
+
+
+def parse_farm_duration(value: str):
+    """
+    Convert a duration into seconds.
+
+    Plain numbers mean hours:
+        12      -> 12 hours
+        12.5    -> 12.5 hours
+
+    Other accepted formats:
+        7h
+        7h30m
+        3d16h
+        1d5h20m
+        45m
+        20s
+    """
+    if value is None:
+        return None
+
+    value = str(value).strip().lower().replace(" ", "")
+    if not value:
+        return None
+
+    try:
+        if value.replace(".", "", 1).isdigit():
+            hours = float(value)
+            return int(hours * 3600) if hours > 0 else None
+    except ValueError:
+        pass
+
+    import re
+
+    pattern = (
+        r"^(?:(\d+(?:\.\d+)?)d)?"
+        r"(?:(\d+(?:\.\d+)?)h)?"
+        r"(?:(\d+(?:\.\d+)?)m)?"
+        r"(?:(\d+(?:\.\d+)?)s)?$"
+    )
+    match = re.fullmatch(pattern, value)
+    if not match:
+        return None
+
+    days = float(match.group(1) or 0)
+    hours = float(match.group(2) or 0)
+    minutes = float(match.group(3) or 0)
+    seconds = float(match.group(4) or 0)
+
+    total = (days * 86400) + (hours * 3600) + (minutes * 60) + seconds
+    return int(total) if total > 0 else None
+
+
 def initialize_farm_database():
     conn = get_spam_db()
-    conn.execute("""
+    cursor = conn.cursor()
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS farm_entries (
             user_id INTEGER NOT NULL,
             world TEXT NOT NULL,
@@ -1282,54 +1335,156 @@ def initialize_farm_database():
         )
     """)
 
-    # Migrate older farm databases that do not have the MAX column yet.
-    columns = [row[1] for row in conn.execute("PRAGMA table_info(farm_entries)").fetchall()]
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS farm_types (
+            farm_type TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            duration_seconds INTEGER NOT NULL,
+            emoji TEXT NOT NULL
+        )
+    """)
+
+    # Keep the MAX migration for older farm databases.
+    columns = [
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(farm_entries)").fetchall()
+    ]
     if "is_max" not in columns:
-        conn.execute(
+        cursor.execute(
             "ALTER TABLE farm_entries ADD COLUMN is_max INTEGER NOT NULL DEFAULT 0"
         )
+
+    # Looming/Fence are no longer built-in farm types.
+    # Remove old entries so they do not remain in the farm panel.
+    cursor.execute("""
+        DELETE FROM farm_entries
+        WHERE LOWER(farm_type) IN ('looming', 'fence')
+    """)
 
     conn.commit()
     conn.close()
     print("✅ Farm database initialized.")
 
 
+def farm_type_get(farm_type):
+    farm_type = normalize_farm_type(farm_type)
+    conn = get_spam_db()
+    row = conn.execute("""
+        SELECT * FROM farm_types
+        WHERE farm_type = ?
+    """, (farm_type,)).fetchone()
+    conn.close()
+    return row
+
+
+def farm_type_get_all():
+    conn = get_spam_db()
+    rows = conn.execute("""
+        SELECT * FROM farm_types
+        ORDER BY label ASC
+    """).fetchall()
+    conn.close()
+    return rows
+
+
+def farm_type_add(farm_type, duration_seconds, emoji):
+    farm_type = normalize_farm_type(farm_type)
+    conn = get_spam_db()
+    conn.execute("""
+        INSERT INTO farm_types
+        (farm_type, label, duration_seconds, emoji)
+        VALUES (?, ?, ?, ?)
+    """, (farm_type, farm_label(farm_type), duration_seconds, emoji))
+    conn.commit()
+    conn.close()
+
+
+def farm_type_edit(farm_type, duration_seconds=None, emoji=None):
+    farm_type = normalize_farm_type(farm_type)
+    conn = get_spam_db()
+    if duration_seconds is not None and emoji is not None:
+        conn.execute("""
+            UPDATE farm_types
+            SET duration_seconds = ?, emoji = ?
+            WHERE farm_type = ?
+        """, (duration_seconds, emoji, farm_type))
+    elif duration_seconds is not None:
+        conn.execute("""
+            UPDATE farm_types
+            SET duration_seconds = ?
+            WHERE farm_type = ?
+        """, (duration_seconds, farm_type))
+    elif emoji is not None:
+        conn.execute("""
+            UPDATE farm_types
+            SET emoji = ?
+            WHERE farm_type = ?
+        """, (emoji, farm_type))
+    conn.commit()
+    conn.close()
+
+
 def farm_get_all(user_id):
     conn = get_spam_db()
-    rows = conn.execute(
-        "SELECT * FROM farm_entries WHERE user_id = ? ORDER BY is_max, farm_type, world",
-        (user_id,)
-    ).fetchall()
+    rows = conn.execute("""
+        SELECT
+            e.user_id,
+            e.world,
+            e.farm_type,
+            e.end_time,
+            e.is_max,
+            t.label,
+            t.duration_seconds,
+            t.emoji
+        FROM farm_entries e
+        JOIN farm_types t ON t.farm_type = e.farm_type
+        WHERE e.user_id = ?
+        ORDER BY e.is_max, t.label, e.world
+    """, (user_id,)).fetchall()
     conn.close()
     return rows
 
 
 def farm_get(user_id, world, farm_type):
+    farm_type = normalize_farm_type(farm_type)
     conn = get_spam_db()
-    row = conn.execute(
-        "SELECT * FROM farm_entries WHERE user_id = ? AND world = ? AND farm_type = ?",
-        (user_id, world, farm_type)
-    ).fetchone()
+    row = conn.execute("""
+        SELECT
+            e.user_id,
+            e.world,
+            e.farm_type,
+            e.end_time,
+            e.is_max,
+            t.label,
+            t.duration_seconds,
+            t.emoji
+        FROM farm_entries e
+        JOIN farm_types t ON t.farm_type = e.farm_type
+        WHERE e.user_id = ? AND e.world = ? AND e.farm_type = ?
+    """, (user_id, world, farm_type)).fetchone()
     conn.close()
     return row
 
 
 def farm_add(user_id, world, farm_type):
+    farm_type = normalize_farm_type(farm_type)
     conn = get_spam_db()
-    conn.execute(
-        "INSERT INTO farm_entries (user_id, world, farm_type, end_time, is_max) VALUES (?, ?, ?, NULL, 0)",
-        (user_id, world, farm_type)
-    )
+    conn.execute("""
+        INSERT INTO farm_entries
+        (user_id, world, farm_type, end_time, is_max)
+        VALUES (?, ?, ?, NULL, 0)
+    """, (user_id, world, farm_type))
     conn.commit()
     conn.close()
 
 
 def farm_remove(user_id, world, farm_type):
+    farm_type = normalize_farm_type(farm_type)
     conn = get_spam_db()
-    cur = conn.execute(
-        "DELETE FROM farm_entries WHERE user_id = ? AND world = ? AND farm_type = ?",
-        (user_id, world, farm_type)
-    )
+    cur = conn.execute("""
+        DELETE FROM farm_entries
+        WHERE user_id = ? AND world = ? AND farm_type = ?
+    """, (user_id, world, farm_type))
     removed = cur.rowcount > 0
     conn.commit()
     conn.close()
@@ -1337,23 +1492,38 @@ def farm_remove(user_id, world, farm_type):
 
 
 def farm_set_end(user_id, world, farm_type, end_time):
+    farm_type = normalize_farm_type(farm_type)
     conn = get_spam_db()
-    conn.execute(
-        "UPDATE farm_entries SET end_time = ? WHERE user_id = ? AND world = ? AND farm_type = ?",
-        (end_time, user_id, world, farm_type)
-    )
+    conn.execute("""
+        UPDATE farm_entries
+        SET end_time = ?
+        WHERE user_id = ? AND world = ? AND farm_type = ?
+    """, (end_time, user_id, world, farm_type))
     conn.commit()
     conn.close()
 
 
 def farm_set_max(user_id, world, farm_type, is_max=True):
+    farm_type = normalize_farm_type(farm_type)
     conn = get_spam_db()
-    conn.execute(
-        "UPDATE farm_entries SET is_max = ?, end_time = ? WHERE user_id = ? AND world = ? AND farm_type = ?",
-        (1 if is_max else 0, None if is_max else None, user_id, world, farm_type)
-    )
+    conn.execute("""
+        UPDATE farm_entries
+        SET is_max = ?, end_time = NULL
+        WHERE user_id = ? AND world = ? AND farm_type = ?
+    """, (1 if is_max else 0, user_id, world, farm_type))
     conn.commit()
     conn.close()
+
+
+def farm_type_autocomplete(current: str):
+    current = current.lower()
+    choices = []
+    for row in farm_type_get_all():
+        if current in row["farm_type"].lower() or current in row["label"].lower():
+            choices.append(
+                app_commands.Choice(name=f"{row['emoji']} {row['label']}", value=row["farm_type"])
+            )
+    return choices[:25]
 
 
 def farm_embed(user_id):
@@ -1362,37 +1532,31 @@ def farm_embed(user_id):
         color=discord.Color.green()
     )
     rows = farm_get_all(user_id)
+
     if not rows:
         embed.description = (
             "You haven't added any farm worlds yet.\n"
-            "Use `/farmadd` to add one."
+            "Use `/farmtypeadd` first if you haven't created a farm type."
         )
         return embed
 
     text = ""
 
-    # MAX farms are shown separately and are intentionally not shown
-    # under Looming/Fence because they no longer have a countdown.
     max_rows = [r for r in rows if r["is_max"] == 1]
     if max_rows:
         text += "👑 **MAX FARM**\n"
         for r in max_rows:
-            info = FARM_TIMERS.get(r["farm_type"])
-            label = info["label"] if info else r["farm_type"].title()
-            text += f"🌎 **{r['world']}** → **MAX** ({label})\n"
+            text += f"🌎 **{r['world']}** → **MAX** ({r['label']})\n"
         text += "\n"
 
-    for key, info in FARM_TIMERS.items():
-        group = [
-            r for r in rows
-            if r["farm_type"] == key and r["is_max"] != 1
-        ]
-        if not group:
+    current_type = None
+    for r in rows:
+        if r["is_max"] == 1:
             continue
-        text += f"{info['emoji']} **{info['label'].upper()}**\n"
-        for r in group:
-            text += f"🌎 **{r['world']}** → {farm_countdown(r['end_time'])}\n"
-        text += "\n"
+        if r["farm_type"] != current_type:
+            current_type = r["farm_type"]
+            text += f"{r['emoji']} **{r['label'].upper()}**\n"
+        text += f"🌎 **{r['world']}** → {farm_countdown(r['end_time'])}\n"
 
     embed.description = text.rstrip()[:4000]
     embed.set_footer(text="Only you can see this • Select a world for actions")
@@ -1404,15 +1568,11 @@ class FarmSelect(discord.ui.Select):
         self.user_id = user_id
         rows = farm_get_all(user_id)
         options = []
+
         for r in rows[:25]:
-            info = FARM_TIMERS.get(r["farm_type"])
-            if not info:
-                continue
-
             is_max = r["is_max"] == 1
-            label = f"{r['world']} — {'MAX' if is_max else info['label']}"
-            emoji = "👑" if is_max else info["emoji"]
-
+            label = f"{r['world']} — {'MAX' if is_max else r['label']}"
+            emoji = "👑" if is_max else r["emoji"]
             options.append(
                 discord.SelectOption(
                     label=label[:100],
@@ -1420,9 +1580,14 @@ class FarmSelect(discord.ui.Select):
                     emoji=emoji
                 )
             )
+
         if not options:
             options = [discord.SelectOption(label="No farms yet", value="__none__")]
-        super().__init__(placeholder="🌾 Select a farm...", options=options)
+
+        super().__init__(
+            placeholder="🌾 Select a farm...",
+            options=options
+        )
 
     async def callback(self, interaction: discord.Interaction):
         value = self.values[0]
@@ -1440,8 +1605,6 @@ class FarmSelect(discord.ui.Select):
             )
             return
 
-        # Selecting a farm no longer starts the timer immediately.
-        # Normal farms get START TIMER + MAX; MAX farms get UNMAX.
         if row["is_max"] == 1:
             view = FarmMaxActionView(interaction.user.id, world, farm_type)
         else:
@@ -1480,10 +1643,9 @@ class FarmActionView(discord.ui.View):
             )
             return
 
-        info = FARM_TIMERS[self.farm_type]
         if row["end_time"] and row["end_time"] > time.time():
             await interaction.response.send_message(
-                f"⏳ **{self.world} — {info['label']}** is already running "
+                f"⏳ **{self.world} — {row['label']}** is already running "
                 f"(`{format_long_time(row['end_time'] - time.time())}` left).",
                 ephemeral=True
             )
@@ -1493,8 +1655,9 @@ class FarmActionView(discord.ui.View):
             self.user_id,
             self.world,
             self.farm_type,
-            time.time() + info["seconds"]
+            time.time() + row["duration_seconds"]
         )
+
         await interaction.response.edit_message(
             embed=farm_embed(self.user_id),
             view=FarmView(self.user_id)
@@ -1561,8 +1724,6 @@ class FarmMaxActionView(discord.ui.View):
 
 def farm_action_embed(user_id, world, farm_type):
     row = farm_get(user_id, world, farm_type)
-    info = FARM_TIMERS[farm_type]
-
     embed = discord.Embed(
         title="🌾 FARM ACTION",
         color=discord.Color.green()
@@ -1575,15 +1736,15 @@ def farm_action_embed(user_id, world, farm_type):
     if row["is_max"] == 1:
         embed.description = (
             f"🌎 **{world}**\n"
+            f"{row['emoji']} **{row['label']}**\n"
             f"👑 **MAX FARM**\n\n"
-            "This farm is excluded from the Looming/Fence timer list."
+            "This farm is removed from the normal timer list."
         )
     else:
-        status = farm_countdown(row["end_time"])
         embed.description = (
             f"🌎 **{world}**\n"
-            f"{info['emoji']} **{info['label']}**\n"
-            f"Current status: {status}\n\n"
+            f"{row['emoji']} **{row['label']}**\n"
+            f"Current status: {farm_countdown(row['end_time'])}\n\n"
             "Choose an action below."
         )
 
@@ -1608,6 +1769,196 @@ class FarmView(discord.ui.View):
             embed=farm_embed(self.user_id),
             view=FarmView(self.user_id)
         )
+
+
+# =========================================================
+# FARM TYPE MANAGEMENT - OWNER ONLY
+# =========================================================
+@bot.tree.command(
+    name="farmtypeadd",
+    description="Create a saved farm type (owner only)"
+)
+@app_commands.describe(
+    farm_type="Farm type name, e.g. pepper",
+    timer="Default timer, e.g. 12h or 1d6h",
+    emoji="Emoji for this farm type"
+)
+async def farmtypeadd(
+    interaction: discord.Interaction,
+    farm_type: str,
+    timer: str,
+    emoji: str
+):
+    if interaction.user.id not in OWNER_USER_IDS:
+        await interaction.response.send_message(
+            "❌ Only the bot owner can create farm types.", ephemeral=True
+        )
+        return
+
+    farm_type = normalize_farm_type(farm_type)
+    if not farm_type or len(farm_type) > 50:
+        await interaction.response.send_message(
+            "❌ Farm type must be between 1 and 50 characters.", ephemeral=True
+        )
+        return
+
+    duration = parse_farm_duration(timer)
+    if duration is None:
+        await interaction.response.send_message(
+            "❌ Invalid timer. Examples: `12h`, `7h30m`, `1d6h`, `45m`.",
+            ephemeral=True
+        )
+        return
+
+    if farm_type_get(farm_type):
+        await interaction.response.send_message(
+            f"❌ **{farm_label(farm_type)}** already exists. Use `/farmtypeedit` instead.",
+            ephemeral=True
+        )
+        return
+
+    emoji = emoji.strip()
+    if not emoji or len(emoji) > 100:
+        await interaction.response.send_message(
+            "❌ Please provide a valid emoji.", ephemeral=True
+        )
+        return
+
+    farm_type_add(farm_type, duration, emoji)
+    await interaction.response.send_message(
+        f"✅ **{farm_label(farm_type)}** created.\n"
+        f"{emoji} Timer: `{format_long_time(duration)}`",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="farmtypeedit",
+    description="Edit a saved farm type (owner only)"
+)
+@app_commands.describe(
+    farm_type="The farm type to edit",
+    timer="New default timer (optional)",
+    emoji="New emoji (optional)"
+)
+async def farmtypeedit(
+    interaction: discord.Interaction,
+    farm_type: str,
+    timer: Optional[str] = None,
+    emoji: Optional[str] = None
+):
+    if interaction.user.id not in OWNER_USER_IDS:
+        await interaction.response.send_message(
+            "❌ Only the bot owner can edit farm types.", ephemeral=True
+        )
+        return
+
+    farm_type = normalize_farm_type(farm_type)
+    current = farm_type_get(farm_type)
+    if current is None:
+        await interaction.response.send_message(
+            f"❌ **{farm_type}** does not exist.", ephemeral=True
+        )
+        return
+
+    if timer is None and emoji is None:
+        await interaction.response.send_message(
+            "❌ Provide a new `timer`, `emoji`, or both.", ephemeral=True
+        )
+        return
+
+    duration = None
+    if timer is not None:
+        duration = parse_farm_duration(timer)
+        if duration is None:
+            await interaction.response.send_message(
+                "❌ Invalid timer. Examples: `12h`, `7h30m`, `1d6h`, `45m`.",
+                ephemeral=True
+            )
+            return
+
+    if emoji is not None:
+        emoji = emoji.strip()
+        if not emoji or len(emoji) > 100:
+            await interaction.response.send_message(
+                "❌ Please provide a valid emoji.", ephemeral=True
+            )
+            return
+
+    farm_type_edit(farm_type, duration, emoji)
+    updated = farm_type_get(farm_type)
+    await interaction.response.send_message(
+        f"✅ **{updated['label']}** updated.\n"
+        f"{updated['emoji']} Timer: `{format_long_time(updated['duration_seconds'])}`",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="farmtypeemoji",
+    description="Change a farm type emoji (owner only)"
+)
+@app_commands.describe(
+    farm_type="The farm type",
+    emoji="The new emoji"
+)
+async def farmtypeemoji(
+    interaction: discord.Interaction,
+    farm_type: str,
+    emoji: str
+):
+    if interaction.user.id not in OWNER_USER_IDS:
+        await interaction.response.send_message(
+            "❌ Only the bot owner can change farm emojis.", ephemeral=True
+        )
+        return
+
+    farm_type = normalize_farm_type(farm_type)
+    if farm_type_get(farm_type) is None:
+        await interaction.response.send_message(
+            f"❌ **{farm_type}** does not exist.", ephemeral=True
+        )
+        return
+
+    emoji = emoji.strip()
+    if not emoji or len(emoji) > 100:
+        await interaction.response.send_message(
+            "❌ Please provide a valid emoji.", ephemeral=True
+        )
+        return
+
+    farm_type_edit(farm_type, emoji=emoji)
+    await interaction.response.send_message(
+        f"✅ **{farm_label(farm_type)}** emoji changed to {emoji}.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="farmtypes",
+    description="List all saved farm types (owner only)"
+)
+async def farmtypes(interaction: discord.Interaction):
+    if interaction.user.id not in OWNER_USER_IDS:
+        await interaction.response.send_message(
+            "❌ Only the bot owner can view the farm type list.", ephemeral=True
+        )
+        return
+
+    rows = farm_type_get_all()
+    if not rows:
+        await interaction.response.send_message(
+            "📭 No farm types have been created yet.", ephemeral=True
+        )
+        return
+
+    text = "\n".join(
+        f"{row['emoji']} **{row['label']}** — `{format_long_time(row['duration_seconds'])}`"
+        for row in rows
+    )
+    await interaction.response.send_message(text[:4000], ephemeral=True)
+
+
 @bot.tree.command(name="farm", description="View your farm timers")
 async def farm(interaction: discord.Interaction):
     await interaction.response.send_message(
@@ -1615,25 +1966,27 @@ async def farm(interaction: discord.Interaction):
         view=FarmView(interaction.user.id),
         ephemeral=True
     )
-    # Save this message so the background loop can update the countdown live.
+
     try:
         message = await interaction.original_response()
         FARM_PANEL_MESSAGES[message.id] = (interaction.user.id, message)
     except discord.HTTPException as e:
-        print(f"❌ Could not register farm panel for auto-countdown: {e}")
+        print(f"❌ Could not register Farm panel for auto-countdown: {e}")
+
 
 @bot.tree.command(name="farmadd", description="Add a farm world (only you can see it)")
 @app_commands.describe(
     world="The world name",
-    farm_type="Which farm is this for?"
+    farm_type="Which saved farm type to use"
 )
-@app_commands.choices(farm_type=FARM_CHOICES)
 async def farmadd(
     interaction: discord.Interaction,
     world: str,
-    farm_type: app_commands.Choice[str]
+    farm_type: str
 ):
     world = normalize_world(world)
+    farm_type = normalize_farm_type(farm_type)
+
     if len(world) > 80:
         await interaction.response.send_message("❌ World name is too long.", ephemeral=True)
         return
@@ -1643,37 +1996,59 @@ async def farmadd(
         )
         return
 
-    key = farm_type.value
-    info = FARM_TIMERS[key]
+    info = farm_type_get(farm_type)
+    if info is None:
+        await interaction.response.send_message(
+            f"❌ **{farm_type}** is not a saved farm type.\n"
+            "Use `/farmtypes` to see available types.",
+            ephemeral=True
+        )
+        return
 
-    if farm_get(interaction.user.id, world, key):
+    if farm_get(interaction.user.id, world, farm_type):
         await interaction.response.send_message(
             f"❌ You already added **{world}** as {info['label']}.", ephemeral=True
         )
         return
 
-    farm_add(interaction.user.id, world, key)
+    farm_add(interaction.user.id, world, farm_type)
     await interaction.response.send_message(
         f"✅ **{world}** added to your private **{info['emoji']} {info['label']}** list.\n"
-        f"⏱️ Timer: `{format_long_time(info['seconds'])}`\n"
+        f"⏱️ Timer: `{format_long_time(info['duration_seconds'])}`\n"
         "Use `/farm` to start it.",
         ephemeral=True
     )
 
+
+@farmadd.autocomplete("farm_type")
+async def farmadd_farm_type_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+    return farm_type_autocomplete(current)
+
+
 @bot.tree.command(name="farmremove", description="Remove one of your farm worlds")
 @app_commands.describe(
     world="The world to remove",
-    farm_type="Which farm it was added to"
+    farm_type="Which saved farm type it uses"
 )
-@app_commands.choices(farm_type=FARM_CHOICES)
 async def farmremove(
     interaction: discord.Interaction,
     world: str,
-    farm_type: app_commands.Choice[str]
+    farm_type: str
 ):
     world = normalize_world(world)
-    info = FARM_TIMERS[farm_type.value]
-    if farm_remove(interaction.user.id, world, farm_type.value):
+    farm_type = normalize_farm_type(farm_type)
+    info = farm_type_get(farm_type)
+
+    if info is None:
+        await interaction.response.send_message(
+            f"❌ **{farm_type}** is not a saved farm type.", ephemeral=True
+        )
+        return
+
+    if farm_remove(interaction.user.id, world, farm_type):
         await interaction.response.send_message(
             f"✅ **{world}** removed from {info['label']}.", ephemeral=True
         )
@@ -1682,20 +2057,34 @@ async def farmremove(
             f"❌ **{world}** isn't in your {info['label']} list.", ephemeral=True
         )
 
-@bot.tree.command(name="farmreset", description="Reset farm timers (a world, or 'all')")
+
+@farmremove.autocomplete("farm_type")
+async def farmremove_farm_type_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+    return farm_type_autocomplete(current)
+
+
+@bot.tree.command(name="farmreset", description="Reset farm timers")
 @app_commands.describe(
     world="World name, or 'all'",
-    farm_type="Optional: only reset this farm type"
+    farm_type="Optional saved farm type"
 )
-@app_commands.choices(farm_type=FARM_CHOICES)
 async def farmreset(
     interaction: discord.Interaction,
     world: str,
-    farm_type: Optional[app_commands.Choice[str]] = None
+    farm_type: Optional[str] = None
 ):
     world = normalize_world(world)
-    wanted_type = farm_type.value if farm_type else None
+    wanted_type = normalize_farm_type(farm_type) if farm_type else None
     count = 0
+
+    if wanted_type and farm_type_get(wanted_type) is None:
+        await interaction.response.send_message(
+            f"❌ **{wanted_type}** is not a saved farm type.", ephemeral=True
+        )
+        return
 
     for r in farm_get_all(interaction.user.id):
         if world != "ALL" and r["world"] != world:
@@ -1716,221 +2105,112 @@ async def farmreset(
     )
 
 
-# =========================================================
-# FARM TIMER - CUSTOM TIME
-# =========================================================
-
-def parse_farm_duration(value: str):
-    """
-    Convert a custom duration into seconds.
-
-    Accepted formats:
-        12              -> 12 hours
-        12.5            -> 12.5 hours
-        7h              -> 7 hours
-        7h30m           -> 7 hours 30 minutes
-        3d16h           -> 3 days 16 hours
-        1d5h20m         -> 1 day 5 hours 20 minutes
-        45m             -> 45 minutes
-        20s             -> 20 seconds
-
-    Spaces are also allowed:
-        3d 16h
-        7h 30m
-    """
-
-    if value is None:
-        return None
-
-    value = str(value).strip().lower().replace(" ", "")
-
-    if not value:
-        return None
-
-    # A plain number means HOURS.
-    try:
-        if value.replace(".", "", 1).isdigit():
-            hours = float(value)
-            if hours > 0:
-                return int(hours * 60 * 60)
-            return None
-    except ValueError:
-        pass
-
-    import re
-
-    pattern = (
-        r"^(?:(\d+(?:\.\d+)?)d)?"
-        r"(?:(\d+(?:\.\d+)?)h)?"
-        r"(?:(\d+(?:\.\d+)?)m)?"
-        r"(?:(\d+(?:\.\d+)?)s)?$"
-    )
-
-    match = re.fullmatch(pattern, value)
-
-    if not match:
-        return None
-
-    days = float(match.group(1) or 0)
-    hours = float(match.group(2) or 0)
-    minutes = float(match.group(3) or 0)
-    seconds = float(match.group(4) or 0)
-
-    total_seconds = (
-        (days * 24 * 60 * 60)
-        + (hours * 60 * 60)
-        + (minutes * 60)
-        + seconds
-    )
-
-    if total_seconds <= 0:
-        return None
-
-    return int(total_seconds)
+@farmreset.autocomplete("farm_type")
+async def farmreset_farm_type_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+    return farm_type_autocomplete(current)
 
 
 @bot.tree.command(
     name="farmtimer",
-    description="Set custom Looming and Fence timers."
+    description="Set a custom timer for one of your farm worlds"
 )
 @app_commands.describe(
     world="Your farm world",
-    looming="Custom Looming time. Example: 37, 7.5, 3d16h",
-    fence="Custom Fence time. Example: 12, 7h30m, 1d5h20m"
+    farm_type="Saved farm type",
+    duration="Custom duration, e.g. 12h, 7h30m, 1d6h"
 )
 async def farmtimer(
     interaction: discord.Interaction,
     world: str,
-    looming: str,
-    fence: str
+    farm_type: str,
+    duration: str
 ):
     world = normalize_world(world)
+    farm_type = normalize_farm_type(farm_type)
+    seconds = parse_farm_duration(duration)
 
-    looming_seconds = parse_farm_duration(looming)
-    fence_seconds = parse_farm_duration(fence)
-
-    if looming_seconds is None:
+    if seconds is None:
         await interaction.response.send_message(
-            "❌ Invalid Looming time.\n\n"
-            "Examples: `37`, `7.5`, `3d16h`, `7h30m`, `45m`",
+            "❌ Invalid duration. Examples: `12h`, `7h30m`, `1d6h`, `45m`.",
             ephemeral=True
         )
         return
 
-    if fence_seconds is None:
+    info = farm_type_get(farm_type)
+    if info is None:
         await interaction.response.send_message(
-            "❌ Invalid Fence time.\n\n"
-            "Examples: `12`, `7.5`, `1d5h20m`, `7h30m`, `45m`",
-            ephemeral=True
+            f"❌ **{farm_type}** is not a saved farm type.", ephemeral=True
         )
         return
 
-    looming_row = farm_get(
-        interaction.user.id,
-        world,
-        "looming"
-    )
-
-    fence_row = farm_get(
-        interaction.user.id,
-        world,
-        "fence"
-    )
-
-    if looming_row is None and fence_row is None:
+    row = farm_get(interaction.user.id, world, farm_type)
+    if row is None:
         await interaction.response.send_message(
-            f"❌ **{world}** is not in your farm list.\n"
+            f"❌ **{world}** is not in your **{info['label']}** farm list.\n"
             "Use `/farmadd` first.",
             ephemeral=True
         )
         return
 
-    # MAX farms are intentionally excluded from timers.
-    max_types = []
-    if looming_row is not None and looming_row["is_max"] == 1:
-        max_types.append("Looming")
-    if fence_row is not None and fence_row["is_max"] == 1:
-        max_types.append("Fence")
-
-    if max_types and ((looming_row is None or looming_row["is_max"] == 1) and
-                      (fence_row is None or fence_row["is_max"] == 1)):
+    if row["is_max"] == 1:
         await interaction.response.send_message(
-            f"👑 **{world}** is marked as MAX and is not running a timer.\n"
-            "Use the `/farm` panel and choose **UNMAX** first if you want to use a timer.",
+            f"👑 **{world}** is marked as MAX. Unmax it first if you want to run a timer.",
             ephemeral=True
         )
         return
 
-    now = time.time()
+    farm_set_end(
+        interaction.user.id,
+        world,
+        farm_type,
+        time.time() + seconds
+    )
 
-    # Only change a timer if that farm type actually exists
-    # for this world. This lets the command work even if the
-    # world has only Looming or only Fence.
-    changed_lines = []
-
-    if looming_row is not None and looming_row["is_max"] != 1:
-        farm_set_end(
-            interaction.user.id,
-            world,
-            "looming",
-            now + looming_seconds
-        )
-        changed_lines.append(
-            f"🧵 **Looming:** `{format_long_time(looming_seconds)}`"
-        )
-
-    if fence_row is not None and fence_row["is_max"] != 1:
-        farm_set_end(
-            interaction.user.id,
-            world,
-            "fence",
-            now + fence_seconds
-        )
-        changed_lines.append(
-            f"🚧 **Fence:** `{format_long_time(fence_seconds)}`"
-        )
-
-    # Update any currently open /farm panel immediately.
     for message_id, (user_id, message) in list(FARM_PANEL_MESSAGES.items()):
         if user_id != interaction.user.id:
             continue
-
         try:
             await message.edit(
                 embed=farm_embed(interaction.user.id),
                 view=FarmView(interaction.user.id)
             )
-        except discord.NotFound:
-            FARM_PANEL_MESSAGES.pop(message_id, None)
-        except discord.Forbidden:
+        except (discord.NotFound, discord.Forbidden):
             FARM_PANEL_MESSAGES.pop(message_id, None)
         except discord.HTTPException as e:
             print(f"❌ Could not update Farm panel after /farmtimer: {e}")
 
     await interaction.response.send_message(
-        f"✅ **{world}** custom farm timer(s) started!\n\n"
-        + "\n".join(changed_lines)
-        + "\n\n⏱️ Countdown starts from now.",
+        f"✅ **{world}** — **{info['label']}** timer started!\n"
+        f"⏱️ Duration: `{format_long_time(seconds)}`\n\n"
+        "⏱️ Countdown starts from now.",
         ephemeral=True
     )
 
 
+@farmtimer.autocomplete("farm_type")
+async def farmtimer_farm_type_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+    return farm_type_autocomplete(current)
+
+
 @tasks.loop(seconds=1)
 async def farm_panel_update_loop():
-    """Edit open farm panels so HH:MM:SS changes without pressing Refresh."""
+    """Edit open farm panels so the countdown changes without Refresh."""
     expired_message_ids = []
 
     for message_id, (user_id, message) in list(FARM_PANEL_MESSAGES.items()):
         try:
             await message.edit(embed=farm_embed(user_id))
         except discord.NotFound:
-            # The user deleted the panel message.
             expired_message_ids.append(message_id)
         except discord.Forbidden:
-            # The bot can no longer edit this message.
             expired_message_ids.append(message_id)
         except discord.HTTPException as e:
-            # Keep tracking the panel for transient API errors/rate limits.
             print(f"❌ Farm panel auto-countdown edit failed: {e}")
 
     for message_id in expired_message_ids:
@@ -1947,34 +2227,35 @@ async def farm_timer_loop():
     try:
         now = time.time()
         conn = get_spam_db()
-        rows = conn.execute(
-            "SELECT * FROM farm_entries WHERE end_time IS NOT NULL AND end_time <= ?",
-            (now,)
-        ).fetchall()
+        rows = conn.execute("""
+            SELECT e.*, t.label, t.emoji
+            FROM farm_entries e
+            JOIN farm_types t ON t.farm_type = e.farm_type
+            WHERE e.end_time IS NOT NULL
+              AND e.end_time <= ?
+              AND e.is_max = 0
+        """, (now,)).fetchall()
         conn.close()
 
         for row in rows:
             user_id = row["user_id"]
             world = row["world"]
             farm_type = row["farm_type"]
-            info = FARM_TIMERS.get(farm_type)
-            if not info:
-                continue
 
             farm_set_end(user_id, world, farm_type, None)
+
             try:
                 user = await bot.fetch_user(user_id)
                 await user.send(
-                    f"{info['emoji']} Your farm **{world}** — "
-                    f"**{info['label']}** is ready!"
+                    f"{row['emoji']} Your farm **{world}** — "
+                    f"**{row['label']}** is ready!"
                 )
             except discord.Forbidden:
-                # DMs closed: ping in channel WITHOUT revealing the world name
                 channel = bot.get_channel(SPAM_CHANNEL_ID)
                 if channel:
                     await channel.send(
-                        f"{info['emoji']} <@{user_id}> one of your "
-                        f"**{info['label']}** timers is ready! (Use `/farm`)",
+                        f"{row['emoji']} <@{user_id}> one of your "
+                        f"**{row['label']}** timers is ready! (Use `/farm`)",
                         delete_after=60
                     )
             except Exception as e:
@@ -1982,9 +2263,11 @@ async def farm_timer_loop():
     except Exception as e:
         print(f"❌ Farm timer loop error: {e}")
 
+
 @farm_timer_loop.before_loop
 async def before_farm_timer_loop():
     await bot.wait_until_ready()
+
 
 @bot.event
 async def on_ready():
@@ -1994,7 +2277,7 @@ async def on_ready():
     print("===================================")
 
     initialize_spam_database()
-    initialize_farm_database()          # <-- NEW
+    initialize_farm_database()
 
     if not hasattr(bot, "_spam_view_registered"):
         bot.add_view(SpamView())
@@ -2011,7 +2294,7 @@ async def on_ready():
         spam_timer_loop.start()
         print("Spam timer loop started.")
 
-    if not farm_timer_loop.is_running():    # <-- NEW
+    if not farm_timer_loop.is_running():
         farm_timer_loop.start()
         print("Farm timer loop started.")
 
